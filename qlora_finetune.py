@@ -2,21 +2,12 @@ import argparse
 import json
 import os
 
-import torch
-from torch.utils.data import DataLoader
-from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    DataCollatorForLanguageModeling,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
 
-# Base model to fine-tune. This is the pretrained (non-instruct) OLMo 3 7B checkpoint.
-MODEL_ID = "allenai/Olmo-3-1025-7B"
+from common import DEFAULT_ADAPTER_DIR, add_data_args, build_bnb_config, build_tokenized_loader, load_split
+from train import train_adamw, train_dp_sgd
 
 # Linear layers LoRA adapters get attached to: the 4 attention projections
 # (query/key/value/output) and the 3 MLP projections (gate/up/down). These are
@@ -26,12 +17,23 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_
 
 def parse_args():
     # Every tunable knob for this script lives here, so nothing needs to be
-    # hardcoded elsewhere. Run `python qlora_dpsgd.py --help` to see all of them.
+    # hardcoded elsewhere. Run `python qlora_finetune.py --help` to see all of them.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-id", default=MODEL_ID)
-    parser.add_argument("--dataset", default="Abirate/english_quotes")
-    parser.add_argument("--text-column", default="quote")
-    parser.add_argument("--max-length", type=int, default=128)
+    add_data_args(parser)
+    # Only meaningful with --dp-sgd: sets the Poisson sample rate that
+    # Opacus's privacy accounting is based on (the *logical* batch), and can
+    # safely be far larger than the GPU can fit -- see --batch-size, which is
+    # what actually runs on the GPU in either mode.
+    parser.add_argument("--logical-batch-size-dp-sgd", type=int, default=8)
+    # The actual per-step GPU batch. With --adamw, this is used directly as
+    # the training batch size. With --dp-sgd, Opacus's BatchMemoryManager
+    # uses it to cap memory by splitting each logical batch
+    # (--logical-batch-size-dp-sgd) into physical chunks of at most this size
+    # before the forward/backward pass; it still only clips+noises+steps once
+    # per logical batch, so the privacy accounting is unaffected by this
+    # value, only the peak GPU memory. Measured on a 24GB RTX 4090 with this
+    # model/LoRA config: 8 peaks at ~9GiB, 16 at ~19GiB, 32 OOMs -- so keep
+    # this at 8-12 regardless of how large --logical-batch-size-dp-sgd is set.
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -46,28 +48,34 @@ def parse_args():
     parser.add_argument("--target-delta", type=float, default=None, help="defaults to 1/(10*len(dataset))")
     # Per-sample gradient clipping threshold (the "C" in DP-SGD's clip-then-noise step).
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    # Exactly one of these picks the training mode -- there is no implicit
+    # default, so it's always explicit which one a given run used.
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    # Opacus DP-SGD: per-sample gradient clipping + Gaussian noise, spends a
+    # (epsilon, delta) privacy budget. See train_dp_sgd() in train.py.
+    mode_group.add_argument("--dp-sgd", action="store_true", help="train with Opacus DP-SGD (private)")
+    # Plain QLoRA fine-tune, a normal AdamW step with no per-sample clipping
+    # or noise. This is the non-private utility upper bound: train it into a
+    # separate --output-dir and pass both adapters to evaluate.py to see
+    # exactly what DP-SGD's clip+noise step costs. See train_adamw() in train.py.
+    mode_group.add_argument("--adamw", action="store_true", help="train without DP (non-private baseline)")
+    # Stop after this many optimizer steps regardless of epochs -- for
+    # quickly smoke-testing the train -> save -> evaluate pipeline before
+    # committing to a full run over the whole dataset.
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=5)
-    parser.add_argument("--output-dir", default="./qlora-dpsgd-adapter")
+    parser.add_argument("--output-dir", default=DEFAULT_ADAPTER_DIR)
     return parser.parse_args()
 
 
 def build_model_and_tokenizer(args):
-    # NF4 (NormalFloat4) with double quantization is the exact quantization
-    # scheme from the QLoRA paper: weights are stored in 4 bits, and are only
-    # dequantized to bf16 on the fly for each matmul during forward/backward.
-    #
     # This config only quantizes nn.Linear submodules (attention
     # q/k/v/o and MLP gate/up/down here) -- transformers replaces each of
     # those with a 4-bit Linear4bit layer at load time. Every other module
     # type (LayerNorm/RMSNorm, embeddings) is left as a regular nn.Parameter
     # in its original dtype; see the prepare_model_for_kbit_training call
     # below for why that matters.
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    bnb_config = build_bnb_config()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     if tokenizer.pad_token is None:
@@ -144,97 +152,40 @@ def build_model_and_tokenizer(args):
     return model, tokenizer
 
 
-def build_data_loader(tokenizer, args):
-    # Small public dataset used purely to exercise the training loop end to
-    # end, not to produce a meaningful fine-tuned model.
-    dataset = load_dataset(args.dataset, split="train")
-
-    def tokenize(batch):
-        out = tokenizer(
-            batch[args.text_column],
-            truncation=True,
-            max_length=args.max_length,
-            padding="max_length",
-        )
-        # Causal LM training predicts the next token at every position, so the
-        # labels are just the input ids themselves (shifted internally by the
-        # model's loss computation).
-        out["labels"] = out["input_ids"].copy()
-        return out
-
-    dataset = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-
-    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    # NOTE: this plain DataLoader gets replaced by Opacus with a Poisson-sampling
-    # DataLoader inside train() -- the privacy accounting depends on that.
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
-    return data_loader, len(dataset)
-
-
-def train(peft_model, data_loader, target_delta, args):
-    # Only optimize the LoRA A/B matrices -- everything else is frozen.
-    trainable_params = [p for p in peft_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
-
-    privacy_engine = PrivacyEngine()
-    # make_private_with_epsilon wraps (model, optimizer, data_loader) into
-    # DP-SGD-aware versions:
-    #   - dp_model: a GradSampleModule that hooks every trainable nn.Linear
-    #     (here, only the LoRA layers) to compute per-sample gradients.
-    #   - dp_optimizer: a DPOptimizer that clips each sample's gradient to
-    #     max_grad_norm, sums them, adds Gaussian noise, then does a normal step.
-    #   - dp_data_loader: a Poisson-sampling loader required for the privacy
-    #     accountant's math to be valid.
-    # The noise multiplier is solved for automatically so that, after `epochs`
-    # passes over the data, the privacy spend equals target_epsilon.
-    dp_model, dp_optimizer, dp_data_loader = privacy_engine.make_private_with_epsilon(
-        module=peft_model,
-        optimizer=optimizer,
-        data_loader=data_loader,
-        target_epsilon=args.target_epsilon,
-        target_delta=target_delta,
-        epochs=args.epochs,
-        max_grad_norm=args.max_grad_norm,
+def build_data_loader(tokenizer, args, batch_size):
+    # Only the "train" side is used here; evaluate.py redoes this same split
+    # (same seed/fraction) and reads the "test" side.
+    dataset = load_split(args.dataset, "train", args.eval_fraction, args.seed)
+    # NOTE: for --dp-sgd, this plain DataLoader gets replaced by Opacus with a
+    # Poisson-sampling DataLoader inside train_dp_sgd() -- the privacy
+    # accounting depends on that.
+    data_loader = build_tokenized_loader(
+        dataset, tokenizer, args.text_column, args.max_length, batch_size, shuffle=True
     )
-    print(f"Using noise_multiplier={dp_optimizer.noise_multiplier:.4f} for target epsilon={args.target_epsilon}")
-
-    device = torch.device("cuda")
-    dp_model.train()
-    for epoch in range(args.epochs):
-        for step, batch in enumerate(dp_data_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            dp_optimizer.zero_grad()
-            # Forward/backward here trigger Opacus's hooks: per-sample grads
-            # are captured for the LoRA layers, then clipped + noised inside
-            # dp_optimizer.step() below (not a plain AdamW step).
-            loss = dp_model(**batch).loss
-            loss.backward()
-            dp_optimizer.step()
-
-            if step % args.log_every == 0:
-                # Privacy spend only grows with the number of steps taken, so
-                # it can be queried at any point during training.
-                eps = privacy_engine.get_epsilon(delta=target_delta)
-                print(f"epoch {epoch} step {step}: loss={loss.item():.4f} eps={eps:.2f}")
-
-    final_eps = privacy_engine.get_epsilon(delta=target_delta)
-    print(f"Final: epsilon={final_eps:.2f}, delta={target_delta:.2e}")
-    return final_eps
+    return data_loader, len(dataset)
 
 
 def main():
     args = parse_args()
     peft_model, tokenizer = build_model_and_tokenizer(args)
-    data_loader, dataset_size = build_data_loader(tokenizer, args)
+    # --dp-sgd needs the loader built at the *logical* batch size so Opacus
+    # derives the right Poisson sample rate; --adamw has no such distinction
+    # and just trains at --batch-size directly.
+    batch_size = args.logical_batch_size_dp_sgd if args.dp_sgd else args.batch_size
+    data_loader, dataset_size = build_data_loader(tokenizer, args, batch_size)
     # Standard rule of thumb: delta should be much smaller than 1/dataset_size,
     # otherwise the privacy guarantee becomes vacuous (allows leaking a
     # non-negligible fraction of individual records with "certainty").
     target_delta = args.target_delta or 1.0 / (10 * dataset_size)
 
-    # train() wraps peft_model in Opacus's GradSampleModule in place; peft_model
-    # itself keeps updating and still exposes save_pretrained() afterwards.
-    final_eps = train(peft_model, data_loader, target_delta, args)
+    if args.adamw:
+        train_adamw(peft_model, data_loader, args)
+        final_eps = None
+    else:
+        # train_dp_sgd() wraps peft_model in Opacus's GradSampleModule in
+        # place; peft_model itself keeps updating and still exposes
+        # save_pretrained() afterwards.
+        final_eps = train_dp_sgd(peft_model, data_loader, target_delta, args)
 
     # peft_model.save_pretrained only writes the small LoRA adapter weights
     # (a few hundred MB), not the full frozen 7B base model.
@@ -242,12 +193,15 @@ def main():
     tokenizer.save_pretrained(args.output_dir)
 
     # Record the actual privacy guarantee this adapter was trained under, so
-    # it can be audited later without re-running training.
+    # it can be audited later without re-running training. For a --adamw run
+    # there is no guarantee to record, so the epsilon/delta/clip fields are
+    # left null and evaluate.py treats that as the non-private baseline.
     privacy_report = {
-        "target_epsilon": args.target_epsilon,
+        "dp_enabled": args.dp_sgd,
+        "target_epsilon": args.target_epsilon if args.dp_sgd else None,
         "achieved_epsilon": final_eps,
-        "delta": target_delta,
-        "max_grad_norm": args.max_grad_norm,
+        "delta": target_delta if args.dp_sgd else None,
+        "max_grad_norm": args.max_grad_norm if args.dp_sgd else None,
         "epochs": args.epochs,
     }
     with open(os.path.join(args.output_dir, "privacy_report.json"), "w") as f:
