@@ -185,7 +185,7 @@ def main():
         # train_dp_sgd() wraps peft_model in Opacus's GradSampleModule in
         # place; peft_model itself keeps updating and still exposes
         # save_pretrained() afterwards.
-        final_eps = train_dp_sgd(peft_model, data_loader, target_delta, args)
+        final_eps, _ = train_dp_sgd(peft_model, data_loader, target_delta, args)
 
     # peft_model.save_pretrained only writes the small LoRA adapter weights
     # (a few hundred MB), not the full frozen 7B base model.
