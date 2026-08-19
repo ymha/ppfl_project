@@ -1,0 +1,64 @@
+[project]
+name = "ppfl-federated"
+version = "0.1.0"
+description = "Federated QLoRA + Opacus DP-SGD + Flower SecAgg+ on OLMo3-7B / MIMIC-IV-Note"
+requires-python = ">=3.10"
+dependencies = ["flwr[simulation]==1.30.0"]
+
+# Documents which module:attribute is the ServerApp/ClientApp, matching
+# Flower's app conventions. Not read by run_local_simulation.py (see
+# federated/config.py's docstring for why) -- kept for anyone later running
+# this via `flwr run` against a real SuperLink.
+[tool.flwr.app.components]
+serverapp = "federated.server_app:app"
+clientapp = "federated.client_app:app"
+
+# The actual config used by server_app.py / client_app.py / fl_common.py's
+# build_fake_args(), loaded directly by federated/config.py.
+[tool.flwr.app.config]
+num-server-rounds = 3
+num-clients = 5
+local-epochs = 1
+local-batch-size = 8
+# 256, not 8 (the CLI default), matching RESULTS.md's single-machine DP-SGD
+# run -- also keeps Opacus's Poisson-sampled logical batch size far from 0
+# (P(empty batch) = e^-mean; at 8 this is ~0.03%, enough to crash the model's
+# forward pass roughly twice per ~7449-step client epoch -- see train.py's
+# empty-batch guard for what happens if it's ever hit anyway).
+local-logical-batch-size-dp-sgd = 256
+lr = 0.0002
+target-epsilon-per-round = 8.0
+max-grad-norm = 1.0
+lora-r = 16
+lora-alpha = 32
+lora-dropout = 0.05
+model-id = "allenai/Olmo-3-1025-7B"
+text-column = "text"
+max-length = 128
+eval-fraction = 0.10
+seed = 42
+log-every = 5
+# 0 = uncapped (one full local epoch per round -- ~7449 physical steps for a
+# ~60k-row shard at batch=8, ~0.6s/step measured -> ~18-19h for the full 5x3
+# run). Capped to keep the experiment to a few hours; Phase 4's final
+# evaluate.py pass is uncapped regardless, matching the single-machine
+# methodology in RESULTS.md exactly.
+max-steps = 1000
+# 0 = evaluate the full held-out split each round; capped here for cheap
+# per-round progress logging only -- the real, reported number comes from an
+# uncapped evaluate.py run in Phase 4.
+eval-max-batches = 300
+secagg-num-shares = 1.0
+secagg-reconstruction-threshold = 0.6
+# Must exceed the largest client shard's row count (partitions/manifest.json)
+# -- SecAgg+ silently clips client weights above this with no error.
+secagg-max-weight = 100000.0
+# Must exceed real LoRA weight magnitudes -- verified against a trained
+# adapter's actual max |weight| (~0.25) in Phase 0; default has ~32x headroom.
+secagg-clipping-range = 8.0
+secagg-quantization-range = 4194304
+# 0 = no timeout. Must stay 0 (or generous) here: collect_masked_vectors_stage
+# is the stage that actually triggers client training, and with only one
+# client able to use the GPU at a time, a finite timeout can expire before
+# slower clients even start -- see server_app.py's comment.
+secagg-timeout = 0
