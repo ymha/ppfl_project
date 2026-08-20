@@ -35,6 +35,12 @@ lora-dropout = 0.05
 model-id = "allenai/Olmo-3-1025-7B"
 text-column = "text"
 max-length = 128
+# true (default) = collapse each subject down to exactly one (seeded-random)
+# note, so every patient contributes exactly one training example -- see
+# federated/fl_common.py's _select_one_note_per_subject(). Set to false to
+# opt out and let a client's shard keep ALL of its subjects' notes instead
+# (a patient with many notes then contributes proportionally more examples).
+one-note-per-subject = true
 eval-fraction = 0.10
 seed = 42
 log-every = 5
