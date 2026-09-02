@@ -8,16 +8,16 @@ from flwr.server.compat import LegacyContext
 from flwr.server.strategy import FedAvg
 from flwr.server.workflow import DefaultWorkflow, SecAggPlusWorkflow
 
-from evaluate import build_eval_loader, perplexity
+from common import build_eval_loader, build_model_and_tokenizer, perplexity
 from federated.client_app import load_manifest
 from federated.config import load_run_config
 from federated.fl_common import LatestParamsHolder, build_fake_args, get_lora_ndarrays, set_lora_ndarrays
 from federated.privacy_report import aggregate_privacy_reports
-from qlora_finetune import build_model_and_tokenizer
 
 GLOBAL_ADAPTER_DIR = os.path.join(os.path.dirname(__file__), "global-adapter")
 
 app = ServerApp()
+
 
 @app.main()
 def main(grid, context: Context) -> None:
@@ -36,12 +36,32 @@ def main(grid, context: Context) -> None:
         f"pyproject.toml's num-clients={num_clients} does not match "
         f"manifest.json's {len(manifest['clients'])} client shards - rerun partition_data.py"
     )
+    # SecAggPlusWorkflow.setup_stage() hard-requires at least 2 sampled clients
+    # (pairwise masking has no counterpart to cancel against with only one) --
+    # with fewer, it logs an error and returns False, which just makes
+    # DefaultWorkflow silently skip every round's fit with no exception raised.
+    # Centralized eval still runs each round regardless, so the run "succeeds"
+    # end-to-end while saving an untrained (zero-init LoRA) adapter. Fail loudly
+    # here instead, before paying for a 7B model load.
+    assert num_clients >= 2, (
+        f"num-clients={num_clients}, but SecAgg+ requires at least 2 clients per "
+        f"round (see flwr's SecAggPlusWorkflow.setup_stage) -- with fewer, fit "
+        f"silently no-ops every round instead of raising"
+    )
+    # Also validated here (not just inside the workflow later) so a bad config
+    # fails before the 7B model load below, not after.
+    secagg_max_weight = float(run_config["secagg-max-weight"])
+    max_shard_rows = max(c["num_rows"] for c in manifest["clients"])
+    assert secagg_max_weight > max_shard_rows, (
+        f"secagg-max-weight={secagg_max_weight} must exceed the largest shard's "
+        f"row count ({max_shard_rows}), or SecAgg+ silently clips client weights"
+    )
 
     fake_args = build_fake_args(run_config)
     fake_args.dataset = manifest["dataset"]
 
-    # Built once, server-side only: 
-    # gives a shape-correct, zero-initialized (lora_B is zero-init by construction) starting adapter for
+    # Built once, server-side only: gives a shape-correct, zero-initialized
+    # (lora_B is zero-init by construction) starting adapter for
     # initial_parameters, and is reused after the run to hold + save the
     # final aggregated LoRA weights and to run centralized held-out eval.
     peft_model, tokenizer = build_model_and_tokenizer(fake_args)
@@ -65,16 +85,13 @@ def main(grid, context: Context) -> None:
     # Deliberately NOT cast to int.
     # TOML gives these back as whatever numeric type was authored (int or float)
     # SecAggPlusWorkflow treats the two differently:
-    # A float is a *proportion* of participating clients (see pyproject.toml's comment), 
-    # so e.g. int(0.6) silently truncating to 0 would corrupt the intended 60% threshold into "no shares needed".
+    # A float is a *proportion* of participating clients (see
+    # pyproject.toml's comment), so e.g. int(0.6) silently truncating to 0
+    # would corrupt the intended 60% threshold into "no shares needed".
     secagg_num_shares = run_config["secagg-num-shares"]
     secagg_threshold = run_config["secagg-reconstruction-threshold"]
-    secagg_max_weight = float(run_config["secagg-max-weight"])
-    max_shard_rows = max(c["num_rows"] for c in manifest["clients"])
-    assert secagg_max_weight > max_shard_rows, (
-        f"secagg-max-weight={secagg_max_weight} must exceed the largest shard's "
-        f"row count ({max_shard_rows}), or SecAgg+ silently clips client weights"
-    )
+    # secagg_max_weight/max_shard_rows already validated above, before the
+    # model load.
 
     strategy = FedAvg(
         fraction_fit=1.0,

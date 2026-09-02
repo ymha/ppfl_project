@@ -23,20 +23,31 @@ def main():
     # the manifest this script writes can never disagree with what
     # server_app.py expects (see its assert on manifest["clients"] length).
     num_clients = load_run_config()["num-clients"]
+    # Matches server_app.py's own num_clients >= 2 assert (SecAgg+ requires at
+    # least 2 clients per round -- with fewer, Flower's SecAggPlusWorkflow
+    # silently no-ops every round instead of raising). Checked here too, before
+    # the full-dataset load_split() below, so a bad pyproject.toml config fails
+    # in seconds instead of after partitioning.
+    assert num_clients >= 2, (
+        f"pyproject.toml's num-clients={num_clients}, but SecAgg+ requires at "
+        f"least 2 clients per round -- see server_app.py's matching check"
+    )
 
-    # Identical calls to what qlora_finetune.py/evaluate.py already use
-    # This partition is carved from the exact same train/eval split
-    # A client shard can never contain a row from the held-out eval set.
+    # Identical calls to what centralized/qlora_finetune.py and
+    # centralized/evaluate.py already use, so this partition is carved from
+    # the exact same train/eval split -- a client shard can never contain a
+    # row from the held-out eval set.
     train_split = load_split(args.dataset, "train", args.eval_fraction, args.seed)
     eval_split = load_split(args.dataset, "test", args.eval_fraction, args.seed)
 
     train_subjects = set(train_split["subject_id"])
     eval_subjects = set(eval_split["subject_id"])
-    # load_split() (common.py) splits at the row (note) level, not the subject level 
-    # -- a subject_id's other notes can legitimately land on either side. 
-    # What we DO guarantee below is the FL-specific invariant: 
+    # load_split() (common.py) splits at the row (note) level, not the subject level
+    # -- a subject_id's other notes can legitimately land on either side.
+    # What we DO guarantee below is the FL-specific invariant:
     # No single row is assigned to two different clients, and
-    # No subject's notes are split across two clients (simulating siloed-by-patient hospital data).
+    # No subject's notes are split across two clients (simulating
+    # siloed-by-patient hospital data).
     subject_overlap = train_subjects & eval_subjects
     print(
         f"Note: the split is done at the note level, not the patient level. "
@@ -55,7 +66,7 @@ def main():
     random.Random(args.seed).shuffle(subject_ids)
     # Round-robin over the sorted-then-shuffled subject list.
     # This balances shard sizes by subject count, not by note count.
-    # clients can still end up with different numbers of notes. 
+    # clients can still end up with different numbers of notes.
     # That's why client_app.py reports each client's true note count as num_examples:
     # FedAvg/SecAgg+ weight the aggregate by it, keeping the imbalance fair.
     shards = [subject_ids[i :: num_clients] for i in range(num_clients)]

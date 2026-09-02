@@ -10,8 +10,9 @@ from federated.server_app import app as server_app
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-cpus", type=int, default=4, help="CPUs reserved per client activation")
-    # 1.0 = the whole GPU per client activation, which is what forces Ray to run client activations one at a time on this single-GPU box 
-    # (see server_app.py/client_app.py's BaseModelCache risk notes).
+    # 1.0 = the whole GPU per client activation, which is what forces Ray to
+    # run client activations one at a time on this single-GPU box (see
+    # server_app.py/client_app.py's BaseModelCache risk notes).
     parser.add_argument("--num-gpus", type=float, default=1.0, help="GPU share reserved per client activation")
     return parser.parse_args()
 

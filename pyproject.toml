@@ -23,8 +23,9 @@ local-batch-size = 8
 # 256, not 8 (the CLI default), matching RESULTS.md's single-machine DP-SGD
 # run -- also keeps Opacus's Poisson-sampled logical batch size far from 0
 # (P(empty batch) = e^-mean; at 8 this is ~0.03%, enough to crash the model's
-# forward pass roughly twice per ~7449-step client epoch -- see train.py's
-# empty-batch guard for what happens if it's ever hit anyway).
+# forward pass roughly twice per ~7449-step client epoch -- see
+# train.py's empty-batch guard for what happens if it's ever hit
+# anyway).
 local-logical-batch-size-dp-sgd = 256
 lr = 0.0002
 target-epsilon-per-round = 8.0
@@ -37,9 +38,11 @@ text-column = "text"
 max-length = 128
 # true (default) = collapse each subject down to exactly one (seeded-random)
 # note, so every patient contributes exactly one training example -- see
-# federated/fl_common.py's _select_one_note_per_subject(). Set to false to
-# opt out and let a client's shard keep ALL of its subjects' notes instead
-# (a patient with many notes then contributes proportionally more examples).
+# common.py's select_one_note_per_subject() (shared with the
+# single-machine --one-note-per-subject flag in centralized/qlora_finetune.py).
+# Set to false to opt out and let a client's shard keep ALL of its subjects'
+# notes instead (a patient with many notes then contributes proportionally
+# more examples).
 one-note-per-subject = true
 eval-fraction = 0.10
 seed = 42
@@ -47,12 +50,12 @@ log-every = 5
 # 0 = uncapped (one full local epoch per round -- ~7449 physical steps for a
 # ~60k-row shard at batch=8, ~0.6s/step measured -> ~18-19h for the full 5x3
 # run). Capped to keep the experiment to a few hours; Phase 4's final
-# evaluate.py pass is uncapped regardless, matching the single-machine
-# methodology in RESULTS.md exactly.
+# centralized/evaluate.py pass is uncapped regardless, matching the
+# single-machine methodology in RESULTS.md exactly.
 max-steps = 1000
 # 0 = evaluate the full held-out split each round; capped here for cheap
 # per-round progress logging only -- the real, reported number comes from an
-# uncapped evaluate.py run in Phase 4.
+# uncapped centralized/evaluate.py run in Phase 4.
 eval-max-batches = 300
 secagg-num-shares = 1.0
 secagg-reconstruction-threshold = 0.6
