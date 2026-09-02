@@ -1,13 +1,12 @@
 import argparse
 import json
-import math
 import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-from common import DEFAULT_ADAPTER_DIR, add_data_args, build_bnb_config, build_tokenized_loader, load_split
+from common import DEFAULT_ADAPTER_DIR, add_data_args, build_bnb_config, build_eval_loader, perplexity
 
 
 def parse_args():
@@ -30,33 +29,6 @@ def parse_args():
     # smoke test of the eval pipeline before running the full pass.
     parser.add_argument("--max-batches", type=int, default=None)
     return parser.parse_args()
-
-
-def build_eval_loader(tokenizer, args):
-    dataset = load_split(args.dataset, "test", args.eval_fraction, args.seed)
-    return build_tokenized_loader(
-        dataset, tokenizer, args.text_column, args.max_length, args.batch_size, shuffle=False
-    )
-
-
-@torch.no_grad()
-def perplexity(model, data_loader, device, max_batches=None):
-    model.eval()
-    total_loss, total_tokens = 0.0, 0
-    for i, batch in enumerate(data_loader):
-        if max_batches and i >= max_batches:
-            break
-        batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(**batch)
-        # out.loss is already averaged over this batch's non-masked (-100)
-        # label positions, so weight by that count before combining batches
-        # into one corpus-level average -- otherwise a half-empty last batch
-        # would count as much as a full one.
-        n_tokens = (batch["labels"] != -100).sum().item()
-        total_loss += out.loss.item() * n_tokens
-        total_tokens += n_tokens
-    mean_loss = total_loss / total_tokens
-    return mean_loss, math.exp(mean_loss)
 
 
 def print_privacy(adapter_dir, label):

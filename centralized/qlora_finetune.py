@@ -2,22 +2,21 @@ import argparse
 import json
 import os
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from opacus.validators import ModuleValidator
-
-from common import DEFAULT_ADAPTER_DIR, add_data_args, build_bnb_config, build_tokenized_loader, load_split
+from common import (
+    DEFAULT_ADAPTER_DIR,
+    add_data_args,
+    build_model_and_tokenizer,
+    build_tokenized_loader,
+    load_split,
+    select_one_note_per_subject,
+)
 from train import train_adamw, train_dp_sgd
-
-# Linear layers LoRA adapters get attached to: the 4 attention projections
-# (query/key/value/output) and the 3 MLP projections (gate/up/down). These are
-# the actual nn.Linear submodule names inside OLMo3's transformer blocks.
-LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def parse_args():
     # Every tunable knob for this script lives here, so nothing needs to be
-    # hardcoded elsewhere. Run `python qlora_finetune.py --help` to see all of them.
+    # hardcoded elsewhere. Run `python -m centralized.qlora_finetune --help`
+    # to see all of them.
     parser = argparse.ArgumentParser()
     add_data_args(parser)
     # Only meaningful with --dp-sgd: sets the Poisson sample rate that
@@ -37,9 +36,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
-
     parser.add_argument("--lora-r", type=int, default=16)
-
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     # Differential privacy budget. Opacus will pick the noise level needed to
@@ -65,97 +62,36 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--output-dir", default=DEFAULT_ADAPTER_DIR)
+    # Off by default, so existing single-machine runs (e.g. the ones behind
+    # RESULTS.md) are unaffected unless explicitly opted into. When set,
+    # collapses the training split to one (seeded-random) note per
+    # subject_id before training -- see common.select_one_note_per_subject()
+    # for why this turns the reported (epsilon, delta) from a per-note into a
+    # genuine per-patient (user-level) guarantee: no subject then contributes
+    # more than one training example, so a neighboring dataset differing in
+    # one record is exactly one differing in one patient's entire
+    # contribution. Matches federated/'s default behavior (see
+    # pyproject.toml's one-note-per-subject) for a single-machine equivalent
+    # experiment. Only affects the training split -- the held-out eval split
+    # is untouched, since it's never part of the DP mechanism.
+    parser.add_argument(
+        "--one-note-per-subject",
+        action="store_true",
+        help="collapse the training set to one note per subject_id, for a user-level "
+        "(per-patient) DP guarantee instead of a per-note one",
+    )
     return parser.parse_args()
-
-
-def build_model_and_tokenizer(args):
-    # This config only quantizes nn.Linear submodules (attention
-    # q/k/v/o and MLP gate/up/down here) -- transformers replaces each of
-    # those with a 4-bit Linear4bit layer at load time. Every other module
-    # type (LayerNorm/RMSNorm, embeddings) is left as a regular nn.Parameter
-    # in its original dtype; see the prepare_model_for_kbit_training call
-    # below for why that matters.
-    bnb_config = build_bnb_config()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if tokenizer.pad_token is None:
-        # OLMo3 base has no dedicated pad token; reuse EOS for batch padding.
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        quantization_config=bnb_config,
-        device_map="cuda",
-    )
-    # Freezes all base weights (requires_grad=False) and upcasts any
-    # remaining fp16/bf16 params (in practice, the LayerNorm/RMSNorm weights)
-    # to fp32 for training stability.
-    #
-    # This does NOT overlap with bnb_4bit_compute_dtype above: that setting
-    # only ever applies to the quantized `Linear4bit` submodules (attention
-    # q/k/v/o and MLP gate/up/down), telling bitsandbytes what dtype to
-    # dequantize *those* weights into for a matmul. BitsAndBytesConfig never
-    # touches LayerNorm/RMSNorm in the first place -- it only replaces
-    # nn.Linear layers with 4-bit ones, so norm layers are loaded as plain
-    # nn.Parameter tensors in the checkpoint's native dtype (bf16 here) and
-    # are left completely untouched by compute_dtype. Without this explicit
-    # upcast, those norm params would just stay in bf16 with no fp32 boost at
-    # all, since nothing else in the pipeline ever promotes them.
-    model = prepare_model_for_kbit_training(model)
-
-    # lora_r (LoRA rank): size of the low-rank matrices A (r x d_in) and B (d_out x r)
-    # that approximate the weight update B@A, instead of learning a full
-    # d_out x d_in delta directly.
-
-    # lora_alpha: scaling factor applied to the LoRA update before it's added to the
-    # frozen base output: out = base_layer(x) + lora_B(lora_A(x)) * (lora_alpha / r).
-    # Raising r alone changes the typical magnitude of B@A, so alpha/r exists
-    # to keep that output scale roughly stable as r is swept -- alpha acts
-    # like a second, independent knob for how strongly the adapter's update
-    # gets blended in, separate from r's role of controlling how expressive
-    # (how high-rank) that update can be. Note lora_B is zero-initialized, so
-    # at step 0, B@A = 0 regardless of alpha -- the scaling only starts to
-    # matter once B moves away from zero during training. 2*r is a common
-    # default ratio (used here: r=16, alpha=32 -> scaling=2.0).
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=LORA_TARGET_MODULES,
-    )
-    # Walks the model, finds every submodule whose name matches
-    # LORA_TARGET_MODULES, and replaces each one in place with a LoRA wrapper
-    # layer: the original (quantized) layer is kept inside it as `base_layer`,
-    # with new lora_A/lora_B nn.Linear submodules added alongside it. That
-    # wrapper's forward is what actually computes
-    #   base_layer(x) + lora_B(lora_A(dropout(x))) * scaling
-    # i.e. get_peft_model is the step that installs the LoRA math described
-    # above into the model, rather than just applying it in the abstract.
-    # Only the newly added lora_A/lora_B params end up with requires_grad=True;
-    # everything else (frozen by prepare_model_for_kbit_training above) stays
-    # frozen. Because task_type="CAUSAL_LM", the returned object is wrapped as
-    # a PeftModelForCausalLM, which is what makes save_pretrained() persist
-    # only the adapter weights (not the full base model) and keeps generate()
-    # working the same way as the underlying causal LM.
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
-
-    # Opacus needs per-sample gradients for every trainable submodule. This
-    # checks the model doesn't contain layer types it can't compute those for
-    # (e.g. BatchNorm, which mixes information across samples in a batch).
-    # Not an issue here since transformers use LayerNorm/RMSNorm instead.
-    errors = ModuleValidator.validate(model, strict=False)
-    print(f"ModuleValidator errors: {errors}")
-
-    return model, tokenizer
 
 
 def build_data_loader(tokenizer, args, batch_size):
     # Only the "train" side is used here; evaluate.py redoes this same split
     # (same seed/fraction) and reads the "test" side.
     dataset = load_split(args.dataset, "train", args.eval_fraction, args.seed)
+    if args.one_note_per_subject:
+        # Must happen before dataset_size is read off below, so target_delta
+        # (1/(10*dataset_size)) and Opacus's sample_rate (1/len(data_loader))
+        # both reflect the actual (smaller, per-patient) training set size.
+        dataset = select_one_note_per_subject(dataset, args.seed)
     # NOTE: for --dp-sgd, this plain DataLoader gets replaced by Opacus with a
     # Poisson-sampling DataLoader inside train_dp_sgd() -- the privacy
     # accounting depends on that.
@@ -203,6 +139,14 @@ def main():
         "delta": target_delta if args.dp_sgd else None,
         "max_grad_norm": args.max_grad_norm if args.dp_sgd else None,
         "epochs": args.epochs,
+        # "user" here means the reported (epsilon, delta) is a per-patient
+        # guarantee (--one-note-per-subject: no subject contributes more than
+        # one training example, so a neighboring-dataset record is exactly a
+        # neighboring-dataset patient). "record" means the same numbers are
+        # only a per-note guarantee -- a patient with N notes in the training
+        # set gets a weaker (roughly N-fold, via group privacy) actual
+        # guarantee than the headline epsilon suggests.
+        "guarantee_level": "user" if args.one_note_per_subject else "record",
     }
     with open(os.path.join(args.output_dir, "privacy_report.json"), "w") as f:
         json.dump(privacy_report, f, indent=2)
