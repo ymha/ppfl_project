@@ -219,3 +219,10 @@ __marimo__/
 
 *.json
 *.safetensors
+
+# Trained LoRA adapter output dirs (centralized/qlora_finetune.py's
+# --output-dir, common.py's DEFAULT_ADAPTER_DIR="./qlora-adapter") -- the
+# *.json/*.safetensors rules above already cover most of their contents, but
+# not the README.md that peft_model.save_pretrained() also writes into each
+# one, so the directory itself still showed up as untracked without this.
+qlora-*/
