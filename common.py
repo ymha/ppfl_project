@@ -64,7 +64,7 @@ def build_bnb_config():
 
 def build_model_and_tokenizer(args):
     # Shared by centralized/qlora_finetune.py and federated/ (server_app.py's
-    # server-side model, and fl_common.BaseModelCache's per-process cached
+    # server-side model, and runtime.BaseModelCache's per-process cached
     # client model) -- both need the identical 4-bit QLoRA + LoRA-wrapped
     # model, just with different LoRA weights loaded in afterwards.
     #
@@ -174,7 +174,7 @@ def select_one_note_per_subject(dataset, seed):
     subject's entire contribution, so the record-level (epsilon, delta)
     already computed applies at the subject level too, with no change to the
     training loop or privacy accounting itself -- only which rows are trained
-    on. Shared with federated/fl_common.py, which applies the same selection
+    on. Shared with federated/runtime.py, which applies the same selection
     per client shard (see pyproject.toml's one-note-per-subject).
     """
     indices_by_subject = {}

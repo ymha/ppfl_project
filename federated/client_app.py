@@ -8,7 +8,7 @@ from flwr.common import Context
 
 from common import build_tokenized_loader
 from federated.config import load_run_config
-from federated.fl_common import (
+from federated.runtime import (
     BaseModelCache,
     build_fake_args,
     get_lora_ndarrays,
@@ -60,7 +60,7 @@ class FlowerLoRAClient(NumPyClient):
         prior_history = load_accountant_history(self.client_id)
 
         # self.peft_model is BaseModelCache's single shared object -- see
-        # train_lock()'s docstring in fl_common.py for why this whole
+        # train_lock()'s docstring in runtime.py for why this whole
         # load-weights -> train -> read-weights sequence must be exclusive.
         # The acquire/release prints are a deliberate, cheap tripwire: if two
         # clients' prints ever interleave without a "released" between them,

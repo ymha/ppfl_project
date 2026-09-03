@@ -124,11 +124,11 @@ sequentially, not on separate machines).
 |---|---|
 | `federated/config.py` | Loads `pyproject.toml`'s `[tool.flwr.app.config]` table directly (see its comment for why, instead of Flower's own `Context.run_config`) |
 | `federated/partition_data.py` | Offline CLI: splits the training set into N client shards by `subject_id`, writes `federated/partitions/manifest.json` |
-| `federated/fl_common.py` | LoRA weight (de)serialization, mapping `pyproject.toml`'s run config onto the CLI's argument shape (`build_fake_args`), per-client shard loading, the process-wide cached base model, cross-round DP accountant history I/O, and the `train_lock()` used to serialize client training on the shared model |
+| `federated/runtime.py` | LoRA weight (de)serialization, mapping `pyproject.toml`'s run config onto the CLI's argument shape (`build_fake_args`), per-client shard loading, the process-wide cached base model, cross-round DP accountant history I/O, and the `train_lock()` used to serialize client training on the shared model |
 | `federated/client_app.py` | Flower `ClientApp` — each client's `fit()` loads the global LoRA weights, trains locally via `train_dp_sgd()`, returns the updated weights |
 | `federated/server_app.py` | Flower `ServerApp` — wires FedAvg through Flower's `SecAggPlusWorkflow`, runs centralized held-out evaluation each round, saves the final aggregated adapter |
 | `federated/privacy_report.py` | Aggregates each client's per-round privacy report into a system-level report (worst-case cumulative epsilon across clients) |
-| `federated/run_local_simulation.py` | Entry point: launches the Flower simulation with both apps above |
+| `federated/simulation.py` | Entry point: launches the Flower simulation with both apps above |
 
 All federated run parameters (number of clients/rounds, local batch/step
 caps, SecAgg+ parameters, etc.) live in `pyproject.toml`'s
@@ -155,7 +155,7 @@ manifest this writes can never disagree with what `server_app.py` expects.
 ### 2. Run the federated simulation
 
 ```bash
-python -m federated.run_local_simulation --num-cpus 4 --num-gpus 1.0
+python -m federated.simulation --num-cpus 4 --num-gpus 1.0
 ```
 
 Saves the aggregated adapter + `privacy_report.json` to

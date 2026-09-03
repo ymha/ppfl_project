@@ -6,14 +6,14 @@ requires-python = ">=3.10"
 dependencies = ["flwr[simulation]==1.30.0"]
 
 # Documents which module:attribute is the ServerApp/ClientApp, matching
-# Flower's app conventions. Not read by run_local_simulation.py (see
+# Flower's app conventions. Not read by simulation.py (see
 # federated/config.py's docstring for why) -- kept for anyone later running
 # this via `flwr run` against a real SuperLink.
 [tool.flwr.app.components]
 serverapp = "federated.server_app:app"
 clientapp = "federated.client_app:app"
 
-# The actual config used by server_app.py / client_app.py / fl_common.py's
+# The actual config used by server_app.py / client_app.py / runtime.py's
 # build_fake_args(), loaded directly by federated/config.py.
 [tool.flwr.app.config]
 num-server-rounds = 3

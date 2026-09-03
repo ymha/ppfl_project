@@ -5,7 +5,7 @@ import tomli
 # flwr's own `flwr run` CLI requires a running SuperLink control-plane
 # process even for local "simulation" federations in this flwr version, and
 # the lighter-weight flwr.simulation.run_simulation() Python API (what
-# run_local_simulation.py actually uses) does NOT auto-populate
+# simulation.py actually uses) does NOT auto-populate
 # Context.run_config from pyproject.toml the way the CLI path would (it
 # starts every run with an empty run_config unless the caller supplies one
 # via a private API). So server_app.py and client_app.py read the
